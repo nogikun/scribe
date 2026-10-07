@@ -45,3 +45,9 @@ uv run pytest
 ffmpeg は不要 (PATH にあれば読めないファイルの予備デコーダとして使う)。
 
 スキルとしての使い方は [../../SKILL.md](../../SKILL.md)。
+
+## ライセンス
+
+Copyright 2026 nogikun
+
+本CLIは [Apache License 2.0](LICENSE) で提供します。利用するモデルと依存ライブラリには、それぞれのライセンスが適用されます。詳細は [第三者ライセンス](../../THIRD_PARTY_NOTICES.md) を参照してください。
