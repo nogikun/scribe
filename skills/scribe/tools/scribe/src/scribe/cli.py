@@ -17,13 +17,17 @@ log = logging.getLogger("scribe")
 
 
 def _speakers(job: dict) -> list[dict]:
+    if job["stages"].get("diarize", {}).get("status") != "completed":
+        return []
     d = J.job_dir(job["job_id"])
     names = J.speaker_names(job["job_id"])
-    spans = J.read_json(d / "samples" / "samples.json", {})
+    spans = (J.read_json(d / "samples" / "samples.json", {})
+             if job["stages"].get("samples", {}).get("status") == "completed" else {})
     talk = {}
     for s in J.read_json(d / "diarization.json", []):
         talk[s["speaker_id"]] = talk.get(s["speaker_id"], 0) + s["end"] - s["start"]
-    merged = J.read_json(d / "merged.json", [])
+    merged = (J.read_json(d / "merged.json", [])
+              if job["stages"].get("merge", {}).get("status") == "completed" else [])
 
     def said(spk, span):  # what the speaker says inside the sample (for whoever can't listen)
         return "".join(m["text"] for m in merged if m["speaker_id"] == spk
@@ -49,15 +53,16 @@ def cmd_process(a):
     if not a.input and not a.job:
         raise J.ScribeError("invalid_argument", "give an input file or --job to resume", 2)
     if a.job and (J.job_dir(a.job) / "job.json").exists():
-        job = J.load(a.job)
-        if a.input and Path(a.input).resolve() != Path(job["input"]):
-            raise J.ScribeError("input_mismatch", f"job {a.job} was created for {job['input']}", 2)
+        job_id = a.job
     elif a.input:
-        job = J.create(a.input, a.job)
+        job_id = J.create(a.input, a.job)["job_id"]
     else:
         raise J.ScribeError("job_not_found", f"job not found: {a.job}", 2)
     given = {k: getattr(a, k) for k in pipeline.DEFAULTS}
-    with J.lock(job["job_id"]):
+    with J.lock(job_id):
+        job = J.load(job_id)
+        if a.input and Path(a.input).resolve() != Path(job["input"]):
+            raise J.ScribeError("input_mismatch", f"job {a.job} was created for {job['input']}", 2)
         opts = pipeline.resolve_opts(job, given)
         J.save(job)
         try:
@@ -67,7 +72,7 @@ def cmd_process(a):
         except Exception as e:
             log.exception("processing failed")
             raise J.ScribeError("processing_failed", f"{type(e).__name__}: {e}", 3)
-    out = _summary(job)
+        out = _summary(job)
     return out, 4 if out["status"] == "speaker_identification_required" else 0
 
 
@@ -97,24 +102,29 @@ def _render(job: dict, fmt: str) -> str:
 
 def _apply_names(job_id: str, updates: dict) -> dict:
     """Save speaker names, then rewrite every file exported earlier so it carries the new names."""
-    ids = J.speaker_ids(job_id)
-    if bad := [s for s in updates if s not in ids]:
-        raise J.ScribeError("unknown_speaker", f"{bad} not in {ids}", 2)
     with J.lock(job_id):
         job = J.load(job_id)
+        if job["stages"].get("diarize", {}).get("status") != "completed":
+            raise J.ScribeError("not_processed", f"job {job_id} has no completed diarization yet", 1)
+        ids = J.speaker_ids(job_id)
+        if bad := [s for s in updates if s not in ids]:
+            raise J.ScribeError("unknown_speaker", f"{bad} not in {ids}", 2)
         names = J.speaker_names(job_id)
         names.update({s: (n or "").strip() or None for s, n in updates.items()})
         J.write_json(J.job_dir(job_id) / "speakers.json", names)
         refreshed = []
-        for fmt, e in list(job.get("exports", {}).items()):
-            try:
-                if not e.get("path"):
-                    raise OSError("printed to stdout")  # nothing on disk to update
-                Path(e["path"]).write_text(_render(job, fmt), encoding="utf-8")
-                e["at"] = datetime.now(timezone.utc).isoformat()
-                refreshed.append(e["path"])
-            except OSError:
-                del job["exports"][fmt]  # not refreshed -> no longer counts as exported
+        for fmt, entries in list(job.get("exports", {}).items()):
+            for e in list(entries):
+                try:
+                    if not e.get("path"):
+                        raise OSError("printed to stdout")  # nothing on disk to update
+                    Path(e["path"]).write_text(_render(job, fmt), encoding="utf-8")
+                    e["at"] = datetime.now(timezone.utc).isoformat()
+                    refreshed.append(e["path"])
+                except OSError:
+                    entries.remove(e)  # not refreshed -> no longer counts as exported
+            if not entries:
+                del job["exports"][fmt]
         J.save(job)
     return {"job_id": job_id, "status": J.status(job), "names": {s: names.get(s) for s in ids},
             "refreshed": refreshed}
@@ -169,20 +179,24 @@ def cmd_speaker_edit(a):
 
 
 def cmd_export(a):
-    job = J.load(a.job)
-    if job["stages"].get("merge", {}).get("status") != "completed":
-        raise J.ScribeError("not_processed", f"job {a.job} has no merged transcript yet (status: {J.status(job)})", 1)
-    text = _render(job, a.format)
     with J.lock(a.job):
         job = J.load(a.job)
+        if job["stages"].get("merge", {}).get("status") != "completed":
+            raise J.ScribeError("not_processed", f"job {a.job} has no merged transcript yet (status: {J.status(job)})", 1)
+        text = _render(job, a.format)
+        path = str(Path(a.output).resolve()) if a.output else None
         if a.output:
-            Path(a.output).write_text(text, encoding="utf-8")
-        job.setdefault("exports", {})[a.format] = {
-            "path": str(Path(a.output).resolve()) if a.output else None,
-            "at": datetime.now(timezone.utc).isoformat()}
+            Path(path).write_text(text, encoding="utf-8")
+        exports = job.setdefault("exports", {})
+        for fmt, entries in list(exports.items()):
+            if path is not None or fmt == a.format:
+                entries[:] = [e for e in entries if e.get("path") != path]
+                if not entries:
+                    del exports[fmt]
+        exports.setdefault(a.format, []).append({"path": path, "at": datetime.now(timezone.utc).isoformat()})
         J.save(job)
     if a.output:
-        return {"job_id": a.job, "format": a.format, "path": job["exports"][a.format]["path"]}, 0
+        return {"job_id": a.job, "format": a.format, "path": path}, 0
     sys.stdout.write(text)  # transcript itself is the result
     return None, 0
 

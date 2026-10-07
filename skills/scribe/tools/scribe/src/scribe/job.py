@@ -56,6 +56,9 @@ def load(job_id: str) -> dict:
     job = read_json(job_dir(job_id) / "job.json")
     if job is None:
         raise ScribeError("job_not_found", f"job not found: {job_id}", 2)
+    for fmt, entries in job.get("exports", {}).items():
+        if isinstance(entries, dict):  # jobs saved before multiple output paths were supported
+            job["exports"][fmt] = [entries]
     return job
 
 
@@ -93,7 +96,10 @@ def status(job: dict) -> str:
 @contextlib.contextmanager
 def lock(job_id: str):
     """OS-level exclusive lock; released automatically if the process dies."""
-    f = open(job_dir(job_id) / ".lock", "a+b")
+    try:
+        f = open(job_dir(job_id) / ".lock", "a+b")
+    except FileNotFoundError:
+        raise ScribeError("job_not_found", f"job not found: {job_id}", 2)
     try:
         try:
             if os.name == "nt":

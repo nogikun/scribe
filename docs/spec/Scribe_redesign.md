@@ -19,7 +19,7 @@
 1. **Backend フォールバックチェーン**: `--diarizer nemotron,pyannote,sherpa` のように順序指定 (これが既定)。未インストール・`HF_TOKEN` 未設定の Backend は即スキップ。ASR は `--asr faster-whisper`、`--device auto` は `cuda → cpu`。
    - フォールバックするのは **Backend 起因の失敗のみ** (未導入 / 例外 / クラッシュ / タイムアウト)。入力不正 (ffprobe で音声なし等) は音声抽出ステージで検出し、Backend を試さず exit 3。
 2. **ステージ単位のプロセス分離 + タイムアウト**: diarize / transcribe は `python -m scribe.backends ...` の子プロセスで実行。メモリは終了時に OS が回収、segfault は親に波及しない。`--stage-timeout` (既定: 音声長×4, 最低 600 秒) 超過で kill し次の Backend へ。
-3. **キャッシュの妥当性検証**: 各ステージは `key` (入力ファイルの size+mtime、Backend チェーン、オプション、**Backend パッケージのバージョン + モデル revision + schema_version**、上流ステージの key) を `job.json` に記録。key 一致 + 成果物存在のときだけ再利用。上流が再計算されたら下流も自動で再計算。
+3. **キャッシュの妥当性検証**: 各ステージは `key` (入力ファイルの size+mtime、Backend チェーン、device を含むオプション、**Backend パッケージのバージョン + モデル revision + schema_version**、上流ステージの key) を `job.json` に記録。key 一致 + 成果物存在のときだけ再利用。再実行を決めた時点で依存ステージの状態・成果物・exports を無効化し、失敗や中断後に旧結果を再利用させない。話者分離の再実行では文字起こしを維持し、文字起こしの再実行では話者名と代表音声を維持する。
 4. **ステージ状態**: `stages.<name> = {status: running|completed|failed, backend, secs, key, error}`。どこで止まったか Agent が判別できる。
 5. **原子的書き込み + ジョブロック**: 書き込みは tmp → `os.replace`。ジョブを変更するコマンド (process / speaker set・rename・edit / export) はジョブ単位の OS ファイルロック (`msvcrt.locking` / `fcntl.flock`) を取る。プロセス死亡で自動解放されるので stale lock なし。取れなければ exit 1 `job_busy`。
 6. **話者名の安全性**: diarize を再計算したら `speakers.json` を破棄し、`samples/` も丸ごと作り直す (SPEAKER_xx の入れ替わりで別人の名前・別人の声を提示するのを防ぐ)。
@@ -91,7 +91,7 @@ uv sync --extra nemotron                 # macOS (PyPI 版 = CPU/MPS)
 | `speaker rename --job ID SPEAKER_00=田中 …` | AI / スクリプト用の一括設定 |
 | `speaker set --job ID --speaker … --name …` | 1 人だけ設定 |
 
-いずれも **以前 `-o` で書き出したファイルを新しい名前で書き直す** (`refreshed` に結果)。書き直せなかった形式は `exports` から外れ、status は正しく `ready` に戻る。修正対象は SPEAKER 番号と名前の対応のみで、発言単位の話者付け替えは対象外。
+いずれも **以前 `-o` で書き出したファイルを新しい名前で書き直す** (`refreshed` に結果)。同じ形式の複数出力先も保持し、同じパスは最後に書き出した形式で登録する。書き直せなかった出力先は `exports` から外れ、更新できた出力が無ければ status は `ready` に戻る。旧形式 (`exports:{fmt:{path,at}}`) のジョブは読み込み時に配列へ変換する。修正対象は SPEAKER 番号と名前の対応のみで、発言単位の話者付け替えは対象外。
 
 `speakers` の出力には `sample_text` (代表音声区間の発話内容) を含む。音声を聞けない AI がユーザーに確認するときの手がかり。
 
@@ -150,7 +150,7 @@ skills/scribe/tools/scribe/
 
 ```
 jobs/<job_id>/
-  job.json            # {job_id, input, created_at, duration, options, stages:{...}, exports:{fmt:{path,at}}}
+  job.json            # {job_id, input, created_at, duration, options, stages:{...}, exports:{fmt:[{path,at},...]}}
   .lock
   audio.wav           # 16kHz mono PCM16
   diarization.json

@@ -28,10 +28,28 @@ def _stage(job, name, key, outputs, fn) -> bool:
         log.info("%s: cached", step)
         return False
     log.info("%s: start", step)
+    affected = [name, *{"audio": ["diarize", "transcribe", "merge", "samples"],
+                       "diarize": ["merge", "samples"], "transcribe": ["merge"]}.get(name, [])]
+    for downstream in affected[1:]:
+        job["stages"].pop(downstream, None)
+    if "merge" in affected:
+        job.pop("exports", None)
     job["stages"][name] = {"status": "running", "key": key}
     save(job)
     t = time.monotonic()
     try:
+        d = job_dir(job["job_id"])
+        if "diarize" in affected:
+            (d / "speakers.json").unlink(missing_ok=True)
+        artifacts = {"audio": "audio.wav", "diarize": "diarization.json", "transcribe": "transcript.json",
+                     "merge": "merged.json", "samples": "samples"}
+        for stage in affected:
+            path = d / artifacts[stage]
+            if stage == "samples":
+                if path.exists():
+                    shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
         extra = fn() or {}
     except Exception as e:
         job["stages"][name].update(status="failed", error=str(e))
@@ -91,32 +109,22 @@ def run(job: dict, opts: dict) -> None:
     timeout = opts["stage_timeout"] or max(600, 4 * job.get("duration", 0))
 
     dchain = opts["diarizer"].split(",")
-    k_diar = {"up": k_audio, "chain": dchain, "num_speakers": opts["num_speakers"],
+    k_diar = {"up": k_audio, "chain": dchain, "device": opts["device"], "num_speakers": opts["num_speakers"],
               "cluster_threshold": opts["cluster_threshold"],
               "versions": backends.versions(dchain)}
 
-    def do_diar():
-        r = _run_chain("diarize", dchain, wav, diar, opts, timeout)
-        (d / "speakers.json").unlink(missing_ok=True)  # SPEAKER_xx may be renumbered
-        return r
-
-    _stage(job, "diarize", k_diar, [diar], do_diar)
+    _stage(job, "diarize", k_diar, [diar], lambda: _run_chain("diarize", dchain, wav, diar, opts, timeout))
 
     achain = opts["asr"].split(",")
-    k_asr = {"up": k_audio, "chain": achain, "model": opts["model"], "language": opts["language"],
+    k_asr = {"up": k_audio, "chain": achain, "device": opts["device"], "model": opts["model"], "language": opts["language"],
              "versions": backends.versions(achain)}
     _stage(job, "transcribe", k_asr, [tr], lambda: _run_chain("transcribe", achain, wav, tr, opts, timeout))
 
     k_merge = {"diar": k_diar, "asr": k_asr, "max_gap": merge.MAX_GAP}
 
-    def do_merge():
-        write_json(merged, merge.merge(read_json(tr), read_json(diar)))
-        job.pop("exports", None)  # old exports no longer match
-
-    _stage(job, "merge", k_merge, [merged], do_merge)
+    _stage(job, "merge", k_merge, [merged], lambda: write_json(merged, merge.merge(read_json(tr), read_json(diar))))
 
     def do_samples():
-        shutil.rmtree(samples, ignore_errors=True)  # drop files of renumbered/removed speakers
         samples.mkdir()
         x = audio.read_wav(wav)
         spans = audio.pick_samples(x, read_json(diar))
@@ -125,7 +133,9 @@ def run(job: dict, opts: dict) -> None:
         write_json(samples / "samples.json", spans)
 
     k_samples = {"diar": k_diar, "params": [audio.SAMPLE_MIN, audio.SAMPLE_MAX, audio.JOIN_GAP]}
-    _stage(job, "samples", k_samples, [samples / "samples.json"], do_samples)
+    sample_outputs = [samples / "samples.json", *(samples / f"{spk}.wav"
+                      for spk in {s["speaker_id"] for s in read_json(diar)})]
+    _stage(job, "samples", k_samples, sample_outputs, do_samples)
 
 
 def resolve_opts(job: dict, given: dict) -> dict:
